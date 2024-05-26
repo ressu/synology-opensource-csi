@@ -29,7 +29,7 @@ var (
 	webapiDebug    = false
 	multipathForUC = true
 	// Locations is tools and directories
-	chrootDir      = "/host"
+	chrootDir      = ""
 	iscsiadmPath   = ""
 	multipathPath  = ""
 	multipathdPath = ""
@@ -126,9 +126,9 @@ func addFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().BoolVarP(&webapiDebug, "debug", "d", webapiDebug, "Enable webapi debugging logs")
 	cmd.PersistentFlags().BoolVar(&multipathForUC, "multipath", multipathForUC, "Set to 'false' to disable multipath for UC")
 	cmd.PersistentFlags().StringVar(&chrootDir, "chroot-dir", chrootDir, "Host directory to chroot into (empty disables chroot)")
-	cmd.PersistentFlags().StringVar(&iscsiadmPath, "iscsiadm", iscsiadmPath, "Full path of iscsiadm executable")
-	cmd.PersistentFlags().StringVar(&multipathPath, "multipath", multipathPath, "Full path of multipath executable")
-	cmd.PersistentFlags().StringVar(&multipathdPath, "multipathd", multipathdPath, "Full path of multipathd executable")
+	cmd.PersistentFlags().StringVar(&iscsiadmPath, "iscsiadm-path", iscsiadmPath, "Full path of iscsiadm executable")
+	cmd.PersistentFlags().StringVar(&multipathPath, "multipath-path", multipathPath, "Full path of multipath executable")
+	cmd.PersistentFlags().StringVar(&multipathdPath, "multipathd-path", multipathdPath, "Full path of multipathd executable")
 
 	cmd.MarkFlagRequired("endpoint")
 	cmd.MarkFlagRequired("client-info")
