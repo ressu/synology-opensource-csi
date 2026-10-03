@@ -1,0 +1,46 @@
+# Copyright 2021 Synology Inc.
+#
+# Alpine variant of Dockerfile for non-OpenShift clusters. The builder stage
+# matches Dockerfile; the final stage is the pre-v1.4.0 Alpine image (before
+# the UBI9 switch for Red Hat certification). It needs no RHEL entitlement,
+# keeps btrfs-progs, and is ~100 MB instead of ~300 MB.
+#
+# ghcr.io/ressu/synology-opensource-csi:v1.4.0-flushbufs was built from this file
+# (alpine:latest resolved to 3.24.2):
+#   podman build -f Dockerfile.alpine -t ghcr.io/ressu/synology-opensource-csi:<tag> .
+#   podman push ghcr.io/ressu/synology-opensource-csi:<tag>
+
+############## Build stage ##############
+FROM golang:1.21.4-alpine as builder
+LABEL stage=synobuilder
+
+RUN apk add --no-cache alpine-sdk
+WORKDIR /go/src/synok8scsiplugin
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY Makefile .
+
+ARG TARGETPLATFORM
+
+COPY main.go .
+COPY pkg ./pkg
+COPY synocli ./synocli
+RUN env GOARCH=$(echo "$TARGETPLATFORM" | cut -f2 -d/) \
+        GOARM=$(echo "$TARGETPLATFORM" | cut -f3 -d/ | cut -c2-) \
+        make
+
+############## Final stage ##############
+FROM docker.io/library/alpine:latest
+LABEL maintainers="Synology Authors" \
+      description="Synology CSI Plugin"
+
+RUN apk add --no-cache e2fsprogs e2fsprogs-extra xfsprogs xfsprogs-extra blkid util-linux iproute2 bash btrfs-progs ca-certificates cifs-utils nfs-utils nvme-cli
+
+# Create symbolic link for chroot.sh
+WORKDIR /
+
+# Copy and run CSI driver
+COPY --from=builder /go/src/synok8scsiplugin/bin/synology-csi-driver synology-csi-driver
+
+ENTRYPOINT ["/synology-csi-driver"]
