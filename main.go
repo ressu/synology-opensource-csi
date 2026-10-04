@@ -7,6 +7,7 @@ package main
 import (
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
@@ -86,6 +87,9 @@ func driverStart() error {
 		"multipath":  multipathPath,
 		"multipathd": multipathdPath,
 		"nvme":       nvmePath,
+	}
+	if chrootDir != "" {
+		driver.HostProcPath = filepath.Join(chrootDir, "proc")
 	}
 	cmdExecutor, err := hostexec.New(cmdMap, chrootDir)
 	if err != nil {
