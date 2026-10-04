@@ -135,3 +135,20 @@ func TestFlushReportsFailure(t *testing.T) {
 		}
 	}
 }
+
+// Closing a disk opened for writing makes udev re-probe it, which races the
+// logout that follows; the fsync has to work without write access.
+func TestFsyncDeviceDoesNotOpenForWriting(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions, so this cannot tell a read-only open apart")
+	}
+	readOnly := filepath.Join(t.TempDir(), "device")
+	if err := os.WriteFile(readOnly, nil, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	tools := NewTools(&recordingExecutor{})
+	if err := tools.fsyncDevice(readOnly); err != nil {
+		t.Errorf("fsync of a device we can only read failed: %v", err)
+	}
+}
