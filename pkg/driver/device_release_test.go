@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"k8s.io/mount-utils"
 )
@@ -79,7 +80,7 @@ func TestReleaseDeviceDoesNothingWhenTheDeviceIsNotMounted(t *testing.T) {
 	useMountInfo(t, staleCopyMountInfo)
 	fake := mount.NewFakeMounter(nil)
 
-	if err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdx", 8, 160); err != nil {
+	if err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdx", "vol", 8, 160); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if targets := unmountedTargets(fake); len(targets) > 0 {
@@ -97,7 +98,7 @@ func TestReleaseDeviceUnmountsAStaleCopy(t *testing.T) {
 		return nil
 	}
 
-	if err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144); err != nil {
+	if err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", "vol", 8, 144); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if targets := unmountedTargets(fake); len(targets) != 1 || targets[0] != hostCopy {
@@ -109,7 +110,7 @@ func TestReleaseDeviceRefusesWhileStillMounted(t *testing.T) {
 	useMountInfo(t, staleCopyMountInfo)
 	fake := mount.NewFakeMounter(nil) // the unmount "succeeds" but the mount stays
 
-	err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144)
+	err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", "vol", 8, 144)
 	if err == nil {
 		t.Fatal("expected an error while the device is still mounted; logging out " +
 			"under a mounted filesystem loses its in-flight writes")
@@ -126,7 +127,7 @@ func TestReleaseDeviceUnmountsNestedMountsFirst(t *testing.T) {
 	})
 	fake := mount.NewFakeMounter(nil)
 
-	_ = newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144)
+	_ = newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", "vol", 8, 144)
 	if targets := unmountedTargets(fake); len(targets) != 2 || targets[0] != "/host/a/b" {
 		t.Errorf("expected /host/a/b to be unmounted before /host/a, got %v", targets)
 	}
@@ -142,7 +143,7 @@ func TestReleaseDeviceRefusesWhileAnotherNamespaceHoldsIt(t *testing.T) {
 	})
 	fake := mount.NewFakeMounter(nil)
 
-	err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144)
+	err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", "vol", 8, 144)
 	if err == nil {
 		t.Fatal("expected an error while another mount namespace holds the device")
 	}
@@ -174,7 +175,133 @@ func TestReleaseDeviceGoesOnWhenOtherNamespacesCannotBeRead(t *testing.T) {
 	useMountInfo(t, nil)
 	HostProcPath = filepath.Join(HostProcPath, "missing")
 
-	if err := newReleaseTestServer(mount.NewFakeMounter(nil)).releaseDeviceNumber("/dev/sdj", 8, 144); err != nil {
+	if err := newReleaseTestServer(mount.NewFakeMounter(nil)).releaseDeviceNumber("/dev/sdj", "vol", 8, 144); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// useClock makes now() return *clock for the test's duration.
+func useClock(t *testing.T, clock *time.Time) {
+	t.Helper()
+	origNow, origTimeout := now, UnstageHolderTimeout
+	now = func() time.Time { return *clock }
+	t.Cleanup(func() { now, UnstageHolderTimeout = origNow, origTimeout })
+}
+
+func addVectorHolder(t *testing.T) {
+	t.Helper()
+	addProcess(t, 4242, "vector", "mnt:[2]", []string{
+		"50 1 8:144 / /var/lib/kubelet/plugins/x/globalmount rw - ext4 /dev/sdj rw",
+	})
+}
+
+// Kubelet's retries see the same deadline, and the error says when the driver
+// will stop waiting, so a stuck detach can be traced back to its cause.
+func TestReleaseDeviceRefusesUntilTheTimeout(t *testing.T) {
+	useMountInfo(t, nil)
+	addVectorHolder(t)
+	clock := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	useClock(t, &clock)
+	UnstageHolderTimeout = 5 * time.Minute
+	ns := newReleaseTestServer(mount.NewFakeMounter(nil))
+
+	for _, after := range []time.Duration{0, time.Minute, 4*time.Minute + 59*time.Second} {
+		clock = time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC).Add(after)
+		err := ns.releaseDeviceNumber("/dev/sdj", "vol", 8, 144)
+		if err == nil {
+			t.Fatalf("expected a refusal %s after the first one", after)
+		}
+		if !strings.Contains(err.Error(), "pid 4242 (vector)") ||
+			!strings.Contains(err.Error(), "disconnecting anyway at 2026-10-04T12:05:00Z") {
+			t.Errorf("expected the holder and the give-up time in the error, got %v", err)
+		}
+	}
+}
+
+func TestReleaseDeviceDisconnectsAnywayAfterTheTimeout(t *testing.T) {
+	useMountInfo(t, nil)
+	addVectorHolder(t)
+	clock := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	useClock(t, &clock)
+	UnstageHolderTimeout = 5 * time.Minute
+	fake := mount.NewFakeMounter(nil)
+	ns := newReleaseTestServer(fake)
+
+	if err := ns.releaseDeviceNumber("/dev/sdj", "vol", 8, 144); err == nil {
+		t.Fatal("expected a refusal before the timeout")
+	}
+	clock = clock.Add(5 * time.Minute)
+	// The fixture has no root to sync through; that is logged, not fatal.
+	if err := ns.releaseDeviceNumber("/dev/sdj", "vol", 8, 144); err != nil {
+		t.Fatalf("expected the disconnect to go ahead after the timeout, got %v", err)
+	}
+	if targets := unmountedTargets(fake); len(targets) > 0 {
+		t.Errorf("must not unmount another namespace's mounts, got %v", targets)
+	}
+	if _, waiting := ns.holderSince["vol"]; waiting {
+		t.Error("expected the wait to be forgotten once the device was let go")
+	}
+}
+
+func TestReleaseDeviceWaitsForeverWithoutATimeout(t *testing.T) {
+	useMountInfo(t, nil)
+	addVectorHolder(t)
+	clock := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	useClock(t, &clock)
+	UnstageHolderTimeout = 0
+	ns := newReleaseTestServer(mount.NewFakeMounter(nil))
+
+	_ = ns.releaseDeviceNumber("/dev/sdj", "vol", 8, 144)
+	clock = clock.Add(24 * time.Hour)
+	err := ns.releaseDeviceNumber("/dev/sdj", "vol", 8, 144)
+	if err == nil {
+		t.Fatal("expected a refusal with the timeout disabled")
+	}
+	if strings.Contains(err.Error(), "disconnecting anyway") {
+		t.Errorf("did not expect a give-up time with the timeout disabled, got %v", err)
+	}
+}
+
+// A holder that lets go resets the wait, so a later hold gets the full timeout.
+func TestReleaseDeviceForgetsTheWaitWhenTheHolderLetsGo(t *testing.T) {
+	useMountInfo(t, nil)
+	addVectorHolder(t)
+	clock := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	useClock(t, &clock)
+	ns := newReleaseTestServer(mount.NewFakeMounter(nil))
+
+	_ = ns.releaseDeviceNumber("/dev/sdj", "vol", 8, 144)
+	if err := os.RemoveAll(filepath.Join(HostProcPath, "4242")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ns.releaseDeviceNumber("/dev/sdj", "vol", 8, 144); err != nil {
+		t.Fatalf("unexpected error once released: %v", err)
+	}
+	if _, waiting := ns.holderSince["vol"]; waiting {
+		t.Error("expected the wait to be forgotten once the holder let go")
+	}
+}
+
+func TestReleaseDeviceTimesEachVolumeSeparately(t *testing.T) {
+	useMountInfo(t, nil)
+	addVectorHolder(t)
+	clock := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	useClock(t, &clock)
+	UnstageHolderTimeout = 5 * time.Minute
+	ns := newReleaseTestServer(mount.NewFakeMounter(nil))
+
+	_ = ns.releaseDeviceNumber("/dev/sdj", "first", 8, 144)
+	clock = clock.Add(5 * time.Minute)
+	if err := ns.releaseDeviceNumber("/dev/sdj", "second", 8, 144); err == nil {
+		t.Error("a volume seen held for the first time must get its own full timeout")
+	}
+}
+
+// The sync reaches the holder's mount through its /proc entry; check the path
+// it builds against this process's own.
+func TestSyncHolderSyncsThroughTheHoldersRoot(t *testing.T) {
+	holder := mountHolder{pid: os.Getpid(), comm: "test", mountPoint: t.TempDir()}
+	if err := syncHolder("/proc", holder); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
