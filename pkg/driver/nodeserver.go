@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -49,6 +50,11 @@ type nodeServer struct {
 	Initiator  *initiatorDriver
 	Client     clientset.Interface
 	tools      tools
+
+	// holderSince records when unstage first found a volume's device held by
+	// another mount namespace; see releaseDevice.
+	holderMutex sync.Mutex
+	holderSince map[string]time.Time
 }
 
 func waitForDevicePathToExist(path string) error {
@@ -266,7 +272,7 @@ func (ns *nodeServer) logoutNVMeSubsystem(nqn string, volumeId string) error {
 	}
 
 	if devPath := getExistedNvmeDevPath(nqn, volumeId); devPath != "" {
-		if err := ns.releaseDevice(devPath); err != nil {
+		if err := ns.releaseDevice(devPath, volumeId); err != nil {
 			return err
 		}
 	}
@@ -326,7 +332,7 @@ func (ns *nodeServer) logoutTarget(k8sVolume *models.K8sVolumeRespSpec) error {
 	volumeMountPath := ns.tools.getExistedVolumeMountPath(k8sVolume.Target.Iqn, mappingIndex)
 
 	if volumeMountPath != "" {
-		if err := ns.releaseDevice(volumeMountPath); err != nil {
+		if err := ns.releaseDevice(volumeMountPath, k8sVolume.VolumeId); err != nil {
 			return err
 		}
 	}
