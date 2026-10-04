@@ -1,0 +1,116 @@
+// Copyright 2021 Synology Inc.
+
+package driver
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"k8s.io/mount-utils"
+)
+
+const (
+	stagingPath = "/var/lib/kubelet/plugins/kubernetes.io/csi/csi.san.synology.com/abc/globalmount"
+	hostCopy    = "/host" + stagingPath
+)
+
+// A node plugin started after the volume was staged: the staging mount has
+// already been unmounted, but its copy under the host root mount is left.
+var staleCopyMountInfo = []string{
+	"25 1 8:6 /lib/kubelet /var/lib/kubelet rw,relatime shared:25 - xfs /dev/sda6 rw",
+	"30 1 8:6 / /host/var rw,relatime shared:434 - xfs /dev/sda6 rw",
+	"40 30 8:144 / " + hostCopy + " rw,relatime shared:506 - ext4 /dev/sdj rw",
+	"41 25 8:16 / /var/lib/kubelet/plugins/other/globalmount rw,relatime shared:292 - ext4 /dev/sdb rw",
+}
+
+func writeMountInfo(t *testing.T, path string, lines []string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// useMountInfo points the driver at a mountinfo fixture for the test's duration.
+func useMountInfo(t *testing.T, lines []string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mountinfo")
+	writeMountInfo(t, path, lines)
+
+	orig := mountInfoPath
+	mountInfoPath = path
+	t.Cleanup(func() { mountInfoPath = orig })
+	return path
+}
+
+func newReleaseTestServer(fake *mount.FakeMounter) *nodeServer {
+	return &nodeServer{Mounter: &mount.SafeFormatAndMount{Interface: fake}}
+}
+
+func unmountedTargets(fake *mount.FakeMounter) []string {
+	var targets []string
+	for _, action := range fake.GetLog() {
+		if action.Action == mount.FakeActionUnmount {
+			targets = append(targets, action.Target)
+		}
+	}
+	return targets
+}
+
+func TestReleaseDeviceDoesNothingWhenTheDeviceIsNotMounted(t *testing.T) {
+	useMountInfo(t, staleCopyMountInfo)
+	fake := mount.NewFakeMounter(nil)
+
+	if err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdx", 8, 160); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if targets := unmountedTargets(fake); len(targets) > 0 {
+		t.Errorf("expected no unmounts, got %v", targets)
+	}
+}
+
+// The case that loses data: the copy under /host keeps the filesystem mounted
+// after the staging path is gone. It must be unmounted before logout.
+func TestReleaseDeviceUnmountsAStaleCopy(t *testing.T) {
+	path := useMountInfo(t, staleCopyMountInfo)
+	fake := mount.NewFakeMounter([]mount.MountPoint{{Device: "/dev/sdj", Path: hostCopy}})
+	fake.UnmountFunc = func(string) error {
+		writeMountInfo(t, path, append(staleCopyMountInfo[:2:2], staleCopyMountInfo[3]))
+		return nil
+	}
+
+	if err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if targets := unmountedTargets(fake); len(targets) != 1 || targets[0] != hostCopy {
+		t.Errorf("expected only %s to be unmounted, got %v", hostCopy, targets)
+	}
+}
+
+func TestReleaseDeviceRefusesWhileStillMounted(t *testing.T) {
+	useMountInfo(t, staleCopyMountInfo)
+	fake := mount.NewFakeMounter(nil) // the unmount "succeeds" but the mount stays
+
+	err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144)
+	if err == nil {
+		t.Fatal("expected an error while the device is still mounted; logging out " +
+			"under a mounted filesystem loses its in-flight writes")
+	}
+	if !strings.Contains(err.Error(), hostCopy) {
+		t.Errorf("expected the error to name %s, got %v", hostCopy, err)
+	}
+}
+
+func TestReleaseDeviceUnmountsNestedMountsFirst(t *testing.T) {
+	useMountInfo(t, []string{
+		"40 1 8:144 / /host/a rw - ext4 /dev/sdj rw",
+		"41 40 8:144 / /host/a/b rw - ext4 /dev/sdj rw",
+	})
+	fake := mount.NewFakeMounter(nil)
+
+	_ = newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144)
+	if targets := unmountedTargets(fake); len(targets) != 2 || targets[0] != "/host/a/b" {
+		t.Errorf("expected /host/a/b to be unmounted before /host/a, got %v", targets)
+	}
+}
