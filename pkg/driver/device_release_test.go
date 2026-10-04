@@ -5,6 +5,7 @@ package driver
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -38,10 +39,26 @@ func useMountInfo(t *testing.T, lines []string) string {
 	path := filepath.Join(t.TempDir(), "mountinfo")
 	writeMountInfo(t, path, lines)
 
-	orig := mountInfoPath
-	mountInfoPath = path
-	t.Cleanup(func() { mountInfoPath = orig })
+	origMountInfo, origHostProc := mountInfoPath, HostProcPath
+	mountInfoPath, HostProcPath = path, t.TempDir()
+	t.Cleanup(func() { mountInfoPath, HostProcPath = origMountInfo, origHostProc })
 	return path
+}
+
+// addProcess adds a process to the fake HostProcPath.
+func addProcess(t *testing.T, pid int, comm, mountNs string, mountInfo []string) {
+	t.Helper()
+	dir := filepath.Join(HostProcPath, strconv.Itoa(pid))
+	if err := os.MkdirAll(filepath.Join(dir, "ns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(mountNs, filepath.Join(dir, "ns", "mnt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "comm"), []byte(comm+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeMountInfo(t, filepath.Join(dir, "mountinfo"), mountInfo)
 }
 
 func newReleaseTestServer(fake *mount.FakeMounter) *nodeServer {
@@ -112,5 +129,52 @@ func TestReleaseDeviceUnmountsNestedMountsFirst(t *testing.T) {
 	_ = newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144)
 	if targets := unmountedTargets(fake); len(targets) != 2 || targets[0] != "/host/a/b" {
 		t.Errorf("expected /host/a/b to be unmounted before /host/a, got %v", targets)
+	}
+}
+
+// A pod that mounts the host's /var/lib without propagation keeps a copy the
+// driver cannot unmount; the disconnect has to wait for it.
+func TestReleaseDeviceRefusesWhileAnotherNamespaceHoldsIt(t *testing.T) {
+	useMountInfo(t, nil)
+	addProcess(t, 1, "kubelet", "mnt:[1]", staleCopyMountInfo[:2])
+	addProcess(t, 4242, "vector", "mnt:[2]", []string{
+		"50 1 8:144 / /var/lib/kubelet/plugins/x/globalmount rw - ext4 /dev/sdj rw",
+	})
+	fake := mount.NewFakeMounter(nil)
+
+	err := newReleaseTestServer(fake).releaseDeviceNumber("/dev/sdj", 8, 144)
+	if err == nil {
+		t.Fatal("expected an error while another mount namespace holds the device")
+	}
+	if !strings.Contains(err.Error(), "pid 4242 (vector)") {
+		t.Errorf("expected the error to name the holding process, got %v", err)
+	}
+	if targets := unmountedTargets(fake); len(targets) > 0 {
+		t.Errorf("must not unmount another namespace's mounts, got %v", targets)
+	}
+}
+
+func TestReleaseDeviceChecksEachNamespaceOnce(t *testing.T) {
+	useMountInfo(t, nil)
+	holder := []string{"50 1 8:144 / /data rw - ext4 /dev/sdj rw"}
+	addProcess(t, 10, "app", "mnt:[7]", holder)
+	addProcess(t, 11, "app", "mnt:[7]", holder)
+
+	holders, err := deviceHolders(HostProcPath, 8, 144)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holders) != 1 {
+		t.Errorf("expected one holder for a shared namespace, got %v", holders)
+	}
+}
+
+// Not being able to look further must not block every unstage.
+func TestReleaseDeviceGoesOnWhenOtherNamespacesCannotBeRead(t *testing.T) {
+	useMountInfo(t, nil)
+	HostProcPath = filepath.Join(HostProcPath, "missing")
+
+	if err := newReleaseTestServer(mount.NewFakeMounter(nil)).releaseDeviceNumber("/dev/sdj", 8, 144); err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
